@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# gh-pr-radar — one command to see every open PR you've authored across GitHub:
+# CI status, review state, blockers and staleness, sorted by what needs you most.
+#
+# Requires: gh (https://cli.github.com), jq.
+# Install:  gh extension install sandeep780049/gh-pr-radar
+
+set -euo pipefail
+
+VERSION="0.1.0"
+GH="${GH_PR_RADAR_GH:-gh}"
+JQ="${GH_PR_RADAR_JQ:-jq}"
+
+# --- output helpers ---------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_DIM=""; C_BOLD=""; C_OFF=""
+fi
+
+usage() {
+  cat <<EOF
+gh-pr-radar ${VERSION} — your open PRs across all of GitHub, on one radar.
+
+usage: gh pr-radar [flags]
+
+flags:
+  --repo <substring>   only show PRs whose repo matches <substring>
+  --json               emit one JSON object per PR (newline-delimited)
+  --limit <n>          max PRs to fetch (default 200)
+  -h, --help           show this help
+  -v, --version        print version
+
+requires: gh (authenticated) and jq.
+EOF
+}
+
+die() { echo "gh-pr-radar: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed."; }
+
+# --- jq program -------------------------------------------------------------
+# Normalizes one PR + its detail payload into a single TSV row:
+# prio, repo, number, ci, reviews, mergeState, draft, ageDays, title, url
+# shellcheck disable=SC2016  # $vars below are jq variables, not shell ones
+JQ_ROW='
+  def failish: any(. == "FAILURE" or . == "TIMED_OUT" or . == "ACTION_REQUIRED"
+                   or . == "STARTUP_FAILURE" or . == "CANCELLED" or . == "STALE");
+  def runnish: any(. == "PENDING" or . == "RUNNING" or . == "QUEUED"
+                   or . == "IN_PROGRESS" or . == "WAITING" or . == "EXPECTED");
+  def okish:   all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED");
+  def ci_summary:
+    ([.statusCheckRollup[] | (.conclusion // .state // "UNKNOWN")]) |
+    if   length == 0 then "none"
+    elif failish then "failing"
+    elif runnish then "running"
+    elif okish   then "passing"
+    else "mixed" end;
+  def rev_summary:
+    if   any(.reviews[]?; .state == "CHANGES_REQUESTED") then "changes-requested"
+    elif any(.reviews[]?; .state == "APPROVED")          then "approved"
+    elif (.reviewRequests | length) > 0                  then "awaiting-review"
+    else "no-reviews" end;
+  def age:
+    ((now - (.updatedAt | fromdateiso8601)) / 86400 | floor);
+  . as $d |
+  {
+    repo:     ($d.base_repo),
+    number:   ($d.number),
+    ci:       ($d | ci_summary),
+    reviews:  ($d | rev_summary),
+    state:    ($d.mergeStateStatus // "UNKNOWN"),
+    draft:    ($d.isDraft),
+    age:      age,
+    title:    ($d.title | gsub("[\\t\\r\\n]"; " ")),
+    url:      ($d.url)
+  } | . + { prio:
+    (if   .state == "DIRTY"                 then 0
+     elif .reviews == "changes-requested"   then 1
+     elif .ci == "failing"                  then 2
+     elif .state == "BLOCKED"               then 3
+     elif .reviews == "awaiting-review"     then 4
+     elif .reviews == "no-reviews"          then 5
+     elif .state == "BEHIND"                then 6
+     else 7 end) } |
+  [.prio, .repo, (.number | tostring), .ci, .reviews, .state,
+   (.draft | tostring), (.age | tostring), .title, .url] | @tsv
+'
+
+# --- fetch ------------------------------------------------------------------
+fetch_list() {
+  local limit="$1"
+  "$GH" search prs \
+    --author "@me" \
+    --state open \
+    --limit "$limit" \
+    --json repository,number \
+    2>/dev/null
+}
+
+# fetch_detail <repo> <number> — merge list row + pr view detail into one object
+fetch_detail() {
+  local repo="$1" num="$2"
+  # shellcheck disable=SC2016  # $repo/$num in the jq program come from --arg
+  "$GH" pr view "$num" -R "$repo" \
+    --json title,url,updatedAt,isDraft,statusCheckRollup,reviews,reviewRequests,mergeStateStatus,mergeable \
+    2>/dev/null | "$JQ" -c --arg repo "$repo" --arg num "$num" \
+       '. + {base_repo: $repo, number: ($num | tonumber)}'
+}
+
+# --- render -----------------------------------------------------------------
+age_label() {
+  local d="$1"
+  if   [ "$d" -lt 1 ]; then echo "today"
+  elif [ "$d" -lt 14 ]; then echo "${d}d"
+  elif [ "$d" -lt 60 ]; then echo "$((d / 7))w"
+  else echo "$((d / 30))mo"; fi
+}
+
+paint_ci() {
+  # pad BEFORE wrapping in color so column widths never count escape bytes
+  local word color=""
+  case "$1" in
+    passing) word="passing"; color=$C_GREEN   ;;
+    failing) word="failing"; color=$C_RED     ;;
+    running) word="running"; color=$C_YELLOW  ;;
+    mixed)   word="mixed";   color=$C_YELLOW  ;;
+    *)       word="none" ;;
+  esac
+  printf '%s' "${color}$(printf '%-8s' "$word")${C_OFF}"
+}
+
+paint_reviews() {
+  # pad BEFORE wrapping in color so column widths never count escape bytes
+  local word color=""
+  case "$1" in
+    changes-requested) word="changes-wanted";  color=$C_RED    ;;
+    approved)          word="approved";        color=$C_GREEN  ;;
+    awaiting-review)   word="awaiting-review"; color=$C_YELLOW ;;
+    *)                 word="no-reviews" ;;
+  esac
+  printf '%s' "${color}$(printf '%-18s' "$word")${C_OFF}"
+}
+
+paint_state() {
+  local word color=""
+  case "$1" in
+    DIRTY)   word="conflicts"; color=$C_RED    ;;
+    BLOCKED) word="blocked";   color=$C_YELLOW ;;
+    BEHIND)  word="behind";    color=$C_DIM    ;;
+    CLEAN)   word="clean";     color=$C_GREEN  ;;
+    DRAFT)   word="draft" ;;
+    *)       word="$(echo "$1" | tr '[:upper:]' '[:lower:]')" ;;
+  esac
+  printf '%s' "${color}$(printf '%-12s' "$word")${C_OFF}"
+}
+
+print_table() {
+  # rows: TSV lines sorted by prio,age. Columns fixed-width, title last (no truncation).
+  printf '%s\n' "${C_BOLD}REPO                          PR       CI        REVIEWS           STATE       AGE     TITLE${C_OFF}"
+  # shellcheck disable=SC2034  # draft/url are read to keep field alignment
+  while IFS=$'\t' read -r _prio repo num ci rev state draft age title url; do
+    printf '%-30s%-9s%s  %s%s%-8s%s\n' \
+      "$repo" "#$num" "$(paint_ci "$ci")" "$(paint_reviews "$rev")" \
+      "$(paint_state "$state")" "$(age_label "$age")" "$title"
+  done
+}
+
+print_summary() {
+  # $1 = raw TSV rows
+  local total failing waiting blocked
+  total=$(printf '%s\n' "$1" | grep -c . || true)
+  failing=$(printf '%s\n' "$1" | awk -F'\t' '$4=="failing"' | grep -c . || true)
+  waiting=$(printf '%s\n' "$1" | awk -F'\t' '$5=="awaiting-review"' | grep -c . || true)
+  blocked=$(printf '%s\n' "$1" | awk -F'\t' '$6=="DIRTY" || $6=="BLOCKED"' | grep -c . || true)
+  printf '%s\n' "${C_DIM}${total} open PR(s), ${failing} failing CI, ${blocked} blocked, ${waiting} awaiting review${C_OFF}"
+}
+
+# --- main -------------------------------------------------------------------
+main() {
+  local filter="" json_output=0 limit=200
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)  [ $# -ge 2 ] || die "--repo requires a value"; filter="$2"; shift 2 ;;
+      --json)  json_output=1; shift ;;
+      --limit) [ $# -ge 2 ] || die "--limit requires a value"; limit="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      -v|--version) echo "gh-pr-radar ${VERSION}"; exit 0 ;;
+      *) die "unknown flag: $1 (try --help)" ;;
+    esac
+  done
+
+  need "$GH"; need "$JQ"
+
+  "$GH" auth status >/dev/null 2>&1 || die "gh is not authenticated; run 'gh auth login'."
+
+  local list
+  list=$(fetch_list "$limit") || die "gh search failed — is gh authenticated and online?"
+  [ -n "$list" ] || { echo "no open PRs authored by you — radar clear."; exit 2; }
+
+  local rows=""
+  local detailed
+  detailed=$(printf '%s' "$list" | "$JQ" -r '
+    .[] | [.repository.nameWithOwner // .repository.name, (.number | tostring)] | @tsv' | tr -d '\r')
+  [ -n "$detailed" ] || { echo "no open PRs authored by you — radar clear."; exit 2; }
+
+  while IFS=$'\t' read -r repo num; do
+    [ -n "$repo" ] || continue
+    local detail
+    if detail=$(fetch_detail "$repo" "$num"); then
+      rows+="$detail"$'\n'
+    else
+      echo "warning: could not fetch detail for $repo#$num" >&2
+    fi
+  done <<< "$detailed"
+
+  [ -n "$rows" ] || die "could not fetch details for any PR."
+
+  local rendered
+  rendered=$(printf '%s' "$rows" | "$JQ" -r "$JQ_ROW" | tr -d '\r' |
+             sort -t$'\t' -k1,1n -k8,8n)
+
+  # filter AFTER enrichment so --repo matches fully qualified names
+  if [ -n "$filter" ]; then
+    rendered=$(printf '%s\n' "$rendered" | grep -i -- "$filter" || true)
+    [ -n "$rendered" ] || { echo "no PRs match --repo '$filter'"; exit 2; }
+  fi
+
+  if [ "$json_output" -eq 1 ]; then
+    printf '%s\n' "$rendered" | "$JQ" -R -r '
+      split("\t") |
+      { prio: (.[0] | tonumber), repo: .[1], number: (.[2] | tonumber), ci: .[3],
+        reviews: .[4], state: .[5], draft: (.[6] == "true"),
+        ageDays: (.[7] | tonumber), title: .[8], url: .[9] }' | tr -d '\r'
+  else
+    print_table <<< "$rendered"
+    print_summary "$rendered"
+  fi
+}
+
+# library mode for tests
+if [ -z "${GH_PR_RADAR_LIB:-}" ]; then
+  main "$@"
+fi
