@@ -8,6 +8,8 @@
 
 **One command to see every open PR you've authored across all of GitHub** — CI status, review state, merge blockers and staleness, sorted by what needs you most.
 
+![gh-pr-radar demo](demo.gif)
+
 ```
 $ gh pr-radar
 REPO                          PR       CI        REVIEWS           STATE       AGE     TITLE
@@ -81,6 +83,17 @@ Ties broken by oldest update first.
 ```
 
 The test suite runs the script against a stubbed `gh` + `jq` fixture, so it needs no network and no auth.
+
+### Regenerating the demo
+
+`demo.gif` is rendered from `demo.cast`, which replays real `gh pr-radar` output captured to `.tmp/`:
+
+```bash
+gh pr-radar --limit 5 > .tmp/out_full.txt
+gh pr-radar --repo kestra --limit 3 > .tmp/out_kestra.txt
+python tools/make_cast.py demo.cast
+agg --font-size 15 --theme dracula demo.cast demo.gif   # agg: asciinema/agg
+```
 
 ## License
 
