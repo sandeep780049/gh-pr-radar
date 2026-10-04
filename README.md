@@ -1,5 +1,11 @@
 # gh-pr-radar
 
+[![CI](https://github.com/sandeep780049/gh-pr-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/sandeep780049/gh-pr-radar/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sandeep780049/gh-pr-radar)](https://github.com/sandeep780049/gh-pr-radar/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![gh extension](https://img.shields.io/badge/gh-extension-blue)](https://cli.github.com)
+[![Stars](https://img.shields.io/github/stars/sandeep780049/gh-pr-radar?style=social)](https://github.com/sandeep780049/gh-pr-radar/stargazers)
+
 **One command to see every open PR you've authored across all of GitHub** — CI status, review state, merge blockers and staleness, sorted by what needs you most.
 
 ```
